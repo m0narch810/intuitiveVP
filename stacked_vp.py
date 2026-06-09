@@ -585,21 +585,26 @@ def backtest(
     tolerance: float,
     years: int = 3,
     lookback_bars: int = 30,
-    forward_bars: int = 240,
+    forward_bars: int = 90,       # 90 min = 1.5 h
     min_sep_bars: int = 60,
     reversal_pct: float = 0.0035,
     quiet: bool = False,
 ) -> pd.DataFrame:
     """
     For each confluence zone, scan the past `years` years of 1-minute data and
-    find every touch.  A touch is a bar whose [low, high] range overlaps the
-    zone ± tolerance.  A reversal is a subsequent move of ≥ reversal_pct from
-    the touch price in the direction opposite to the approach.
+    find every qualifying touch.
+
+    Touch requirements (both must be true):
+      1. Bar's [low, high] range overlaps zone ± tolerance  (wick enters zone)
+      2. Bar's close stays within 2 × tolerance of zone     (no runaway blowthrough)
 
     Approach direction:
       - 'resistance': close lookback_bars before touch was above zone + tolerance
       - 'support':    close lookback_bars before touch was below zone - tolerance
-      - 'ambiguous':  price was already inside the zone (accept any ≥ threshold move)
+      - 'ambiguous':  price was already inside the zone
+
+    Reversal: price moves ≥ reversal_pct in the approach-opposite direction
+              within the next forward_bars bars.
     """
     last_date  = df["date"].max()
     start_date = last_date - pd.Timedelta(days=int(years * 365.25))
@@ -617,8 +622,11 @@ def backtest(
         p   = zone.price
         tol = tolerance
 
-        # All bars where price overlaps the zone
-        raw_touches = np.where((lo <= p + tol) & (hi >= p - tol))[0]
+        # Touch = wick enters zone AND close stays near zone (filters runaways)
+        close_near  = np.abs(cl - p) <= tol * 2
+        raw_touches = np.where(
+            (lo <= p + tol) & (hi >= p - tol) & close_near
+        )[0]
 
         # Deduplicate: keep first touch in any run of min_sep_bars
         deduped: list[int] = []
@@ -682,29 +690,102 @@ def backtest(
     return pd.DataFrame(rows).sort_values("reversal_rate", ascending=False)
 
 
-def print_backtest_report(bt: pd.DataFrame, reversal_pct: float = 0.0035):
+def _baseline_rate(df: pd.DataFrame, n_samples: int, tolerance: float,
+                   forward_bars: int, min_sep_bars: int,
+                   reversal_pct: float, years: int) -> float:
+    """
+    Sample n_samples random price levels from the backtest window and compute
+    their average touch-weighted reversal rate using identical methodology.
+    This is the 'random level' baseline our zones must beat.
+    """
+    last_date  = df["date"].max()
+    start_date = last_date - pd.Timedelta(days=int(years * 365.25))
+    df3 = df[df["date"] >= start_date].reset_index(drop=True)
+    hi  = df3["high"].values.astype(np.float64)
+    lo  = df3["low"].values.astype(np.float64)
+    cl  = df3["close"].values.astype(np.float64)
+    n   = len(df3)
+
+    # Sample random prices from the data's own range so they're realistic levels
+    all_rates, all_touches = [], []
+    rng = np.random.default_rng(seed=42)
+    prices = rng.uniform(lo.min(), hi.max(), size=n_samples * 3)
+    # Keep only prices that have at least 10 touches (otherwise too noisy)
+    tested = 0
+    for p in prices:
+        if tested >= n_samples:
+            break
+        close_near  = np.abs(cl - p) <= tolerance * 2
+        raw = np.where((lo <= p + tolerance) & (hi >= p - tolerance) & close_near)[0]
+        deduped = []
+        last_t = -min_sep_bars
+        for t in raw:
+            if t - last_t >= min_sep_bars:
+                deduped.append(t); last_t = t
+        if len(deduped) < 10:
+            continue
+        revs = 0
+        for t in deduped:
+            tp  = cl[t]
+            thr = reversal_pct * tp
+            prev_cl = cl[max(0, t - 30)]
+            fwd_end = min(n, t + forward_bars + 1)
+            fwd_hi  = hi[t:fwd_end].max()
+            fwd_lo  = lo[t:fwd_end].min()
+            if prev_cl > p + tolerance:
+                move = tp - fwd_lo
+            elif prev_cl < p - tolerance:
+                move = fwd_hi - tp
+            else:
+                move = max(tp - fwd_lo, fwd_hi - tp)
+            if move >= thr:
+                revs += 1
+        rate = revs / len(deduped)
+        all_rates.append(rate)
+        all_touches.append(len(deduped))
+        tested += 1
+
+    if not all_rates:
+        return 0.0
+    total_t = sum(all_touches)
+    return float(sum(r * t for r, t in zip(all_rates, all_touches)) / total_t)
+
+
+def print_backtest_report(df: pd.DataFrame, bt: pd.DataFrame,
+                          reversal_pct: float = 0.0035,
+                          tolerance: float = BIN_SIZE):
     pct_str = f"{reversal_pct*100:.2f}%"
-    sep = "-" * 88
+
+    print("  Computing baseline (30 random price levels)...", end="", flush=True)
+    baseline = _baseline_rate(df, n_samples=30, tolerance=tolerance,
+                              forward_bars=90, min_sep_bars=60,
+                              reversal_pct=reversal_pct, years=3)
+    print(f"  baseline = {baseline:.1%}")
+
+    sep = "-" * 92
     print(f"\n{sep}")
-    print(f"  BACKTEST — reversal threshold {pct_str} of price  (3-year window)")
+    print(f"  BACKTEST — threshold {pct_str}  |  90-bar window  |  close-confirmed  |  baseline {baseline:.1%}")
     print(sep)
     print(f"  {'PRICE':>9}  {'SCORE':>5}  {'TF':>2}  {'TOUCHES':>7}  "
-          f"{'REVS':>5}  {'RATE':>6}  {'AVG_REV%':>8}  TYPES")
+          f"{'REVS':>5}  {'RATE':>6}  {'vs BASE':>7}  {'AVG_REV%':>8}  TYPES")
     print(sep)
     for _, r in bt.iterrows():
-        flag = " *" if r["reversal_rate"] >= 0.60 else "  "
+        edge = r["reversal_rate"] - baseline
+        flag = " *" if edge >= 0.08 else "  "
         print(f"  {r['price']:>9.2f}  {r['score']:>5.1f}  {r['n_tf']:>2}  "
               f"{r['touches']:>7}  {r['reversals']:>5}  "
-              f"{r['reversal_rate']:>5.1%}  {r['avg_rev_pct']:>7.3f}%  "
-              f"{r['ftypes']}{flag}")
+              f"{r['reversal_rate']:>5.1%}  {edge:>+6.1%}  "
+              f"{r['avg_rev_pct']:>7.3f}%  {r['ftypes']}{flag}")
     print(sep)
-    above = bt[bt["reversal_rate"] >= 0.50]
-    elite = bt[bt["reversal_rate"] >= 0.60]
-    print(f"  Zones >= 50% reversal rate : {len(above)}")
-    print(f"  Zones >= 60% reversal rate : {len(elite)}  (* in table)")
-    if len(above):
-        print(f"  Avg score of >=50% zones   : {above['score'].mean():.1f}  "
-              f"(all zones avg: {bt['score'].mean():.1f})")
+
+    zone_rate = float((bt["reversal_rate"] * bt["touches"]).sum() / bt["touches"].sum())
+    lift      = zone_rate - baseline
+    above     = bt[bt["reversal_rate"] - baseline >= 0.05]
+    print(f"\n  Random baseline rate        : {baseline:.1%}")
+    print(f"  All-zone weighted rate      : {zone_rate:.1%}")
+    print(f"  Lift over baseline          : {lift:+.1%}")
+    print(f"  Zones beating baseline +5%  : {len(above)} of {len(bt)}")
+    print(f"  Zones beating baseline +8%  : {sum(1 for _, r in bt.iterrows() if r['reversal_rate'] - baseline >= 0.08)}  (* in table)")
 
 
 # ─── Gradient Tuning Sweep ────────────────────────────────────────────────────
@@ -784,6 +865,117 @@ def tune_shelf_gradient(
     return result
 
 
+# ─── Sample Days ──────────────────────────────────────────────────────────────
+
+def plot_sample_days(df: pd.DataFrame, zones: list, n: int = 15,
+                     bin_size: float = BIN_SIZE, seed: int = None):
+    """
+    Generate n full-day OHLC charts with stacked VP zone overlays.
+    Days are chosen randomly across the full dataset range.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    df2 = df.copy()
+    df2["_day"] = df2["date"].dt.date
+
+    # Pre-compute each day's price range
+    day_ranges = df2.groupby("_day").agg(lo=("low", "min"), hi=("high", "max"))
+
+    # Keep only days where at least one zone falls within the session range
+    zone_prices = np.array([z.price for z in zones]) if zones else np.array([])
+    if len(zone_prices):
+        def _has_zone(row):
+            return np.any((zone_prices >= row.lo) & (zone_prices <= row.hi))
+        eligible = day_ranges[day_ranges.apply(_has_zone, axis=1)].index.tolist()
+    else:
+        eligible = day_ranges.index.tolist()
+
+    if not eligible:
+        print("  No days found with zones in price range — using unconstrained sample")
+        eligible = day_ranges.index.tolist()
+
+    chosen = sorted(np.random.choice(eligible, size=min(n, len(eligible)),
+                                     replace=False))
+
+    zone_prices = np.array([z.price for z in zones]) if zones else np.array([])
+    max_score   = max(z.score for z in zones) if zones else 1.0
+    cmap        = plt.cm.YlOrRd
+    dark        = "#0D1117"
+
+    print(f"\n  Generating {len(chosen)} day charts...")
+
+    for idx, day in enumerate(chosen):
+        bars = df2[df2["_day"] == day].copy().reset_index(drop=True)
+        if len(bars) < 30:
+            print(f"  [{idx+1:02d}/{n}]  {day}  — skipped (too few bars)")
+            continue
+
+        price_lo = bars["low"].min()
+        price_hi = bars["high"].max()
+        spread   = price_hi - price_lo
+        pad      = spread * 0.10
+        y_lo, y_hi = price_lo - pad, price_hi + pad
+
+        fig, ax = plt.subplots(figsize=(18, 7), facecolor=dark)
+        ax.set_facecolor(dark)
+        for sp in ax.spines.values():
+            sp.set_color("#21262D")
+
+        _draw_ohlc(ax, bars)
+
+        # Zone bands and labels
+        visible = [z for z in zones if y_lo <= z.price <= y_hi]
+        for zone in visible:
+            ns     = zone.score / max_score
+            colour = cmap(0.15 + 0.85 * ns)
+            hw     = bin_size * 1.3
+            ax.axhspan(zone.price - hw, zone.price + hw,
+                       color=colour, alpha=0.10 + 0.48 * ns, linewidth=0)
+            ax.axhline(zone.price, color=colour, lw=0.6, alpha=0.55, ls="--")
+            tfs = ",".join(sorted(zone.timeframes))
+            fts = "|".join(sorted(zone.ftypes))
+            ax.annotate(
+                f"{zone.price:.0f}  {fts} [{tfs}]",
+                xy=(len(bars) - 1, zone.price),
+                xytext=(8, 0), textcoords="offset points",
+                color=colour, fontsize=6.0, va="center",
+                fontfamily="monospace", clip_on=False,
+            )
+
+        # x-axis: time of day
+        nb       = len(bars)
+        ts_vals  = bars["date"].values
+        n_ticks  = min(10, nb)
+        tick_idx = np.linspace(0, nb - 1, n_ticks, dtype=int)
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels(
+            [pd.Timestamp(ts_vals[i]).strftime("%H:%M") for i in tick_idx],
+            fontsize=7, color="#8B949E",
+        )
+        ax.set_xlim(0, nb - 1)
+        ax.set_ylim(y_lo, y_hi)
+        ax.tick_params(axis="y", colors="#8B949E", labelsize=8)
+        ax.tick_params(axis="x", colors="#8B949E", labelsize=7, length=3)
+        ax.set_ylabel("Price  (NQ)", color="#8B949E", fontsize=9)
+
+        day_str = str(day)
+        ax.set_title(
+            f"NQ  {day_str}  ·  {nb} bars  ·  {len(visible)} zone(s) in range  "
+            f"(rolling VP zones as of {df['date'].max().date()})",
+            color="#F0F6FC", fontsize=10, pad=8, fontweight="bold",
+        )
+
+        plt.tight_layout(pad=0.5)
+        out = f"day_{day_str}.png"
+        fig.savefig(out, dpi=130, bbox_inches="tight", facecolor=dark)
+        plt.close(fig)
+        print(f"  [{idx+1:02d}/{n}]  {day_str}  bars={nb:4d}  "
+              f"zones={len(visible)}  → {out}")
+
+    print(f"  Done.")
+
+
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def main():
@@ -812,6 +1004,8 @@ def main():
                         help="Random seed for --random (for reproducibility)")
     parser.add_argument("--tune-gradients", action="store_true",
                         help="Sweep SHELF_SLOPE_MAX and report backtest metrics per step")
+    parser.add_argument("--sample-days",   type=int, default=0,
+                        help="Generate N full-day OHLC charts with zone overlays")
     args = parser.parse_args()
 
     DISPLAY_BARS = args.display
@@ -838,6 +1032,10 @@ def main():
         print_report(zones, show_n=args.top)
         results[label] = zones
 
+        if args.sample_days > 0:
+            plot_sample_days(df, zones, n=args.sample_days,
+                             bin_size=args.bins, seed=args.seed)
+
         if args.tune_gradients:
             tune_shelf_gradient(df, profiles, bin_size=args.bins,
                                 reversal_pct=args.rev_pct / 100.0)
@@ -850,7 +1048,8 @@ def main():
                 tolerance=args.bins,
                 reversal_pct=rev_threshold,
             )
-            print_backtest_report(bt, reversal_pct=rev_threshold)
+            print_backtest_report(df, bt, reversal_pct=rev_threshold,
+                                      tolerance=args.bins)
             bt_file = f"backtest_{'anchored' if anchored else 'rolling'}.csv"
             bt.to_csv(bt_file, index=False)
             print(f"  Full results saved → {bt_file}")
